@@ -1,0 +1,204 @@
+name: Contract Interface Compatibility Check
+
+# Runs on every PR to main. Extracts each contract's XDR spec (via
+# `stellar contract inspect`) on the PR branch and diffs it against the
+# same spec built from main, flagging any breaking ABI change for manual
+# review. The job is informational — it does not fail the PR.
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  interface-compat:
+    name: XDR interface diff
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history needed so we can check out the base branch later.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Install stellar-cli
+        run: cargo install stellar-cli --locked
+
+      # ── PR branch ────────────────────────────────────────────────────────
+
+      - name: Build optimized WASMs (PR branch)
+        run: make build-optimized
+
+      - name: Extract interface specs — PR branch
+        run: |
+          mkdir -p specs/pr
+          CONTRACTS="access_control financing_pool invoice_nft marketplace price_oracle risk_registry treasury"
+          for c in $CONTRACTS; do
+            wasm="target/wasm32-unknown-unknown/release/kora_${c}.optimized.wasm"
+            [ -f "$wasm" ] || wasm="target/wasm32-unknown-unknown/release/kora_${c}.wasm"
+            if [ -f "$wasm" ]; then
+              stellar contract inspect --wasm "$wasm" > "specs/pr/${c}.txt" 2>&1
+            else
+              printf '(contract not built on PR branch)\n' > "specs/pr/${c}.txt"
+            fi
+          done
+
+      # ── main branch ──────────────────────────────────────────────────────
+
+      - name: Build optimized WASMs (main branch) and extract specs
+        run: |
+          git fetch origin main
+          git checkout origin/main -- .
+
+          make build-optimized 2>/dev/null || true
+
+          mkdir -p specs/main
+          CONTRACTS="access_control financing_pool invoice_nft marketplace price_oracle risk_registry treasury"
+          for c in $CONTRACTS; do
+            wasm="target/wasm32-unknown-unknown/release/kora_${c}.optimized.wasm"
+            [ -f "$wasm" ] || wasm="target/wasm32-unknown-unknown/release/kora_${c}.wasm"
+            if [ -f "$wasm" ]; then
+              stellar contract inspect --wasm "$wasm" > "specs/main/${c}.txt" 2>&1
+            else
+              printf '(contract not on main branch)\n' > "specs/main/${c}.txt"
+            fi
+          done
+
+          # Restore PR source so subsequent steps see the right code.
+          git checkout "${{ github.sha }}" -- .
+
+      # ── diff & report ────────────────────────────────────────────────────
+
+      - name: Generate compatibility report
+        id: report
+        run: |
+          CONTRACTS="access_control financing_pool invoice_nft marketplace price_oracle risk_registry treasury"
+          HAS_BREAKING=0
+
+          {
+            echo "## Contract Interface Compatibility Report"
+            echo ""
+            echo "_Extracted via \`stellar contract inspect\` on compiled WASMs."
+            echo "Compares public function signatures and stored-type shapes against \`main\`."
+            echo "Removals or signature changes require manual review before merging._"
+            echo ""
+          } > compat_report.md
+
+          for c in $CONTRACTS; do
+            pr_spec="specs/pr/${c}.txt"
+            main_spec="specs/main/${c}.txt"
+
+            echo "### \`kora_${c}\`" >> compat_report.md
+            echo "" >> compat_report.md
+
+            if grep -q "(contract not on main branch)" "$main_spec" 2>/dev/null; then
+              echo "New contract — no baseline on \`main\`. No compatibility check needed." >> compat_report.md
+              echo "" >> compat_report.md
+              continue
+            fi
+
+            if grep -q "(contract not built on PR branch)" "$pr_spec" 2>/dev/null; then
+              echo "**Contract removed or build failed — potentially breaking.**" >> compat_report.md
+              HAS_BREAKING=1
+              echo "" >> compat_report.md
+              continue
+            fi
+
+            diff_out=$(diff "$main_spec" "$pr_spec" 2>/dev/null || true)
+
+            if [ -z "$diff_out" ]; then
+              echo "No interface changes." >> compat_report.md
+            else
+              # Lines present in main but absent in PR are potentially breaking.
+              removed=$(printf '%s\n' "$diff_out" | grep -c '^< ' || echo 0)
+
+              if [ "$removed" -gt 0 ]; then
+                echo "**⚠ Potentially breaking** — $removed line(s) removed from the interface spec." >> compat_report.md
+                HAS_BREAKING=1
+              else
+                echo "Additive changes only — non-breaking." >> compat_report.md
+              fi
+
+              {
+                echo ""
+                echo "<details><summary>Show interface diff</summary>"
+                echo ""
+                echo '```diff'
+                # Translate diff(1) `< ` / `> ` markers to standard `- ` / `+ `.
+                printf '%s\n' "$diff_out" | sed 's/^< /- /;s/^> /+ /'
+                echo '```'
+                echo ""
+                echo "</details>"
+              } >> compat_report.md
+            fi
+
+            echo "" >> compat_report.md
+          done
+
+          {
+            echo "---"
+            echo ""
+            if [ "$HAS_BREAKING" -gt 0 ]; then
+              echo "> [!WARNING]"
+              echo "> One or more contracts have potentially breaking interface changes."
+              echo "> Review carefully before merging to avoid breaking deployed instances or the TypeScript SDK."
+            else
+              echo "> [!NOTE]"
+              echo "> No breaking interface changes detected."
+            fi
+          } >> compat_report.md
+
+          cat compat_report.md
+          echo "breaking=$HAS_BREAKING" >> "$GITHUB_OUTPUT"
+
+      - name: Publish report as workflow summary
+        run: cat compat_report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post report as PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('compat_report.md', 'utf8');
+            const marker = '<!-- interface-compat-report -->';
+            const fullBody = `${marker}\n${body}`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: fullBody,
+              });
+            }

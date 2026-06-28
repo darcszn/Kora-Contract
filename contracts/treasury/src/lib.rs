@@ -1,12 +1,13 @@
 #![no_std]
 
 use kora_shared::{
+    audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
     validation::{require_valid_fee_bps, require_within_max_amount, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 
 // ── Storage TTL constants (~31 days in ledgers) ───────────────────────────────
 const PERSISTENT_BUMP_AMOUNT: u32 = 535_680;
@@ -39,6 +40,13 @@ pub enum DataKey {
     EpochStart,
     /// Total withdrawn in the current epoch (resets each epoch).
     EpochWithdrawn,
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    /// Next write position in the audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
+    AuditLogHead,
+    /// Total admin actions ever recorded (monotonic; not capped at ring size).
+    AuditLogTotal,
+    /// An audit log entry at ring-buffer position `n`.
+    AuditEntry(u64),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -93,6 +101,7 @@ impl TreasuryContract {
         Self::bump_persistent(&env, &DataKey::FeeBps);
 
         events::fee_rate_updated(&env, &admin, old_bps, fee_bps);
+        Self::append_audit_entry(&env, &admin, AdminActionType::SetFeeBps);
         Ok(())
     }
 
@@ -108,6 +117,7 @@ impl TreasuryContract {
         Self::bump_persistent(&env, &DataKey::WhitelistedToken(token.clone()));
 
         events::token_whitelisted(&env, &admin, &token);
+        Self::append_audit_entry(&env, &admin, AdminActionType::WhitelistToken);
         Ok(())
     }
 
@@ -183,6 +193,7 @@ impl TreasuryContract {
         token_client.transfer(&env.current_contract_address(), &recipient, &amount);
 
         events::fee_withdrawn(&env, &admin, &token, amount);
+        Self::append_audit_entry(&env, &admin, AdminActionType::Withdraw);
         Ok(())
     }
 
@@ -209,7 +220,7 @@ impl TreasuryContract {
             token_client.transfer(&env.current_contract_address(), &recipient, &balance);
             events::emergency_withdrawn(&env, &admin, &token, balance);
         }
-
+        Self::append_audit_entry(&env, &admin, AdminActionType::EmergencyWithdraw);
         Ok(())
     }
 
@@ -231,6 +242,7 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::WithdrawalCapProposal, &(new_cap, env.ledger().timestamp()));
         events::withdrawal_cap_proposed(&env, &admin, new_cap);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ProposeWithdrawalCap);
         Ok(())
     }
 
@@ -259,6 +271,7 @@ impl TreasuryContract {
             .instance()
             .remove(&DataKey::WithdrawalCapProposal);
         events::withdrawal_cap_updated(&env, &admin, old_cap, new_cap);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ExecuteWithdrawalCap);
         Ok(())
     }
 
@@ -311,6 +324,7 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
         events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::TreasuryProposeUpgrade);
         Ok(())
     }
 
@@ -327,8 +341,50 @@ impl TreasuryContract {
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::TreasuryExecuteUpgrade);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
+    }
+
+    // ── Audit Log ─────────────────────────────────────────────────────────────
+
+    /// Return a page of audit log entries, newest first.
+    /// `page` is 0-indexed; `page_size` is clamped to 1–50.
+    pub fn get_audit_log(env: Env, page: u32, page_size: u32) -> Vec<AdminAuditEntry> {
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+        let stored = total.min(MAX_AUDIT_LOG_SIZE);
+
+        let skip = (page as u64).saturating_mul(page_size);
+        let mut results = Vec::new(&env);
+
+        let mut i: u64 = 0;
+        while i < page_size {
+            let offset = skip + i;
+            if offset >= stored {
+                break;
+            }
+            let pos = (head + MAX_AUDIT_LOG_SIZE - 1 - offset) % MAX_AUDIT_LOG_SIZE;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AdminAuditEntry>(&DataKey::AuditEntry(pos))
+            {
+                results.push_back(entry);
+            }
+            i += 1;
+        }
+
+        results
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -422,6 +478,42 @@ impl TreasuryContract {
             PERSISTENT_LIFETIME_THRESHOLD,
             PERSISTENT_BUMP_AMOUNT,
         );
+    }
+
+    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+
+        let entry = AdminAuditEntry {
+            sequence: total,
+            timestamp: env.ledger().timestamp(),
+            actor: actor.clone(),
+            action,
+            source: AuditSource::Treasury,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditEntry(head), &entry);
+        Self::bump_persistent(env, &DataKey::AuditEntry(head));
+
+        events::admin_action_audited(env, &entry);
+
+        let next_head = (head + 1) % MAX_AUDIT_LOG_SIZE;
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogHead, &next_head);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogTotal, &(total + 1));
     }
 }
 

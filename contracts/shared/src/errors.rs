@@ -22,6 +22,7 @@ pub enum KoraError {
     InvalidDueDate = 15,
     InvalidRiskScore = 16,
     InvalidCid = 17,
+    InvoiceFrozen = 18,
 
     // Marketplace
     ListingNotFound = 20,
@@ -85,4 +86,9 @@ pub enum KoraError {
     GovernanceThresholdNotMet = 114,
     GovernanceTimelockNotElapsed = 115,
     InvalidParameterValue = 116,
+    // Cooldown between debtor risk score updates per (verifier, debtor_hash) pair
+    ScoreUpdateCooldownNotElapsed = 117,
+    // Marketplace two-phase cancellation
+    CancellationPending = 118,
+    NoCancellationPending = 119,
 }

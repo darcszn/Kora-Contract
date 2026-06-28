@@ -1,18 +1,23 @@
 #![no_std]
 
 use kora_shared::{
+    audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
     types::SmeProfile,
     validation::{require_exact_length, require_valid_risk_score, UPGRADE_TIMELOCK_DELAY},
 };
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec};
 
 // ── TTL constants (in ledgers; ~5s per ledger on Stellar) ────────────────────
 /// ~30 days worth of ledgers for persistent SME/verifier data
 const PERSISTENT_TTL_THRESHOLD: u32 = 518_400;
 const PERSISTENT_TTL_BUMP: u32 = 518_400;
+
+/// Minimum seconds between consecutive updates to the same debtor's score by the same verifier.
+/// Prevents rapid manipulation immediately before a funding or default decision.
+pub const MIN_SCORE_UPDATE_INTERVAL: u64 = 3_600; // 1 hour
 
 // ── Storage Keys ─────────────────────────────────────────────────────────────
 
@@ -28,7 +33,16 @@ pub enum DataKey {
     VerifierReputation(Address), // reputation score of verifier
     SmeProfile(Address),
     DebtorScore(Bytes), // keyed by debtor_hash (SHA-256 of PII)
+    /// Ledger timestamp of the last set_debtor_score call per (verifier, debtor_hash).
+    DebtorScoreLastUpdate(Address, Bytes),
     UpgradeProposal,
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    /// Next write position in the audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
+    AuditLogHead,
+    /// Total admin actions ever recorded (monotonic; not capped at ring size).
+    AuditLogTotal,
+    /// An audit log entry at ring-buffer position `n`.
+    AuditEntry(u64),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -76,6 +90,7 @@ impl RiskRegistryContract {
         env.storage().persistent().set(&DataKey::Admin, &new_admin);
         Self::bump_persistent(&env, &DataKey::Admin);
         events::admin_transferred(&env, &admin, &new_admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RegistryTransferAdmin);
         Ok(())
     }
 
@@ -119,6 +134,7 @@ impl RiskRegistryContract {
         Self::bump_persistent(&env, &DataKey::VerifierStake(verifier.clone()));
         Self::bump_persistent(&env, &DataKey::VerifierReputation(verifier.clone()));
         events::verifier_added(&env, &admin, &verifier);
+        Self::append_audit_entry(&env, &admin, AdminActionType::AddVerifier);
         Ok(())
     }
 
@@ -162,6 +178,7 @@ impl RiskRegistryContract {
             .persistent()
             .remove(&DataKey::VerifierReputation(verifier.clone()));
         events::verifier_removed(&env, &admin, &verifier);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RemoveVerifier);
         Ok(())
     }
 
@@ -197,6 +214,7 @@ impl RiskRegistryContract {
             defaults: 0,
             registered_at: env.ledger().timestamp(),
             compliance_attested,
+            credit_limit: 0,
         };
 
         env.storage()
@@ -351,10 +369,15 @@ impl RiskRegistryContract {
             .set(&DataKey::SmeProfile(sme.clone()), &profile);
         Self::bump_persistent(&env, &DataKey::SmeProfile(sme.clone()));
         events::sme_default_recorded(&env, &admin, &sme, profile.defaults);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RecordDefault);
         Ok(())
     }
 
     /// Store a debtor risk score keyed by debtor hash. Verifier only.
+    ///
+    /// Enforces a per-(verifier, debtor_hash) cooldown of MIN_SCORE_UPDATE_INTERVAL seconds
+    /// between consecutive updates so that rapid score changes immediately before a
+    /// funding or default decision cannot be used to manipulate outcomes.
     pub fn set_debtor_score(
         env: Env,
         verifier: Address,
@@ -366,10 +389,29 @@ impl RiskRegistryContract {
         // Validate exact 32-byte SHA-256 length before score
         require_exact_length(&debtor_hash, 32)?;
         require_valid_risk_score(score)?;
+
+        // Enforce cooldown: same verifier cannot update the same debtor_hash within
+        // MIN_SCORE_UPDATE_INTERVAL seconds of the previous update.
+        let cooldown_key = DataKey::DebtorScoreLastUpdate(verifier.clone(), debtor_hash.clone());
+        if let Some(last_update) = env.storage().persistent().get::<_, u64>(&cooldown_key) {
+            let next_allowed = last_update
+                .checked_add(MIN_SCORE_UPDATE_INTERVAL)
+                .ok_or(KoraError::ArithmeticOverflow)?;
+            if env.ledger().timestamp() < next_allowed {
+                return Err(KoraError::ScoreUpdateCooldownNotElapsed);
+            }
+        }
+
         env.storage()
             .persistent()
             .set(&DataKey::DebtorScore(debtor_hash.clone()), &score);
         Self::bump_persistent(&env, &DataKey::DebtorScore(debtor_hash.clone()));
+
+        // Record the update timestamp so the next call can check the cooldown.
+        let now = env.ledger().timestamp();
+        env.storage().persistent().set(&cooldown_key, &now);
+        Self::bump_persistent(&env, &cooldown_key);
+
         events::debtor_score_set(&env, &verifier, &debtor_hash, score);
         Ok(())
     }
@@ -456,6 +498,7 @@ impl RiskRegistryContract {
             .instance()
             .set(&DataKey::UpgradeProposal, &(new_wasm_hash.clone(), env.ledger().timestamp()));
         events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RegistryProposeUpgrade);
         Ok(())
     }
 
@@ -472,8 +515,50 @@ impl RiskRegistryContract {
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RegistryExecuteUpgrade);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
+    }
+
+    // ── Audit Log ─────────────────────────────────────────────────────────────
+
+    /// Return a page of audit log entries, newest first.
+    /// `page` is 0-indexed; `page_size` is clamped to 1–50.
+    pub fn get_audit_log(env: Env, page: u32, page_size: u32) -> Vec<AdminAuditEntry> {
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+        let stored = total.min(MAX_AUDIT_LOG_SIZE);
+
+        let skip = (page as u64).saturating_mul(page_size);
+        let mut results = Vec::new(&env);
+
+        let mut i: u64 = 0;
+        while i < page_size {
+            let offset = skip + i;
+            if offset >= stored {
+                break;
+            }
+            let pos = (head + MAX_AUDIT_LOG_SIZE - 1 - offset) % MAX_AUDIT_LOG_SIZE;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AdminAuditEntry>(&DataKey::AuditEntry(pos))
+            {
+                results.push_back(entry);
+            }
+            i += 1;
+        }
+
+        results
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -520,6 +605,42 @@ impl RiskRegistryContract {
             .persistent()
             .extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
+
+    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+
+        let entry = AdminAuditEntry {
+            sequence: total,
+            timestamp: env.ledger().timestamp(),
+            actor: actor.clone(),
+            action,
+            source: AuditSource::RiskRegistry,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditEntry(head), &entry);
+        Self::bump_persistent(env, &DataKey::AuditEntry(head));
+
+        events::admin_action_audited(env, &entry);
+
+        let next_head = (head + 1) % MAX_AUDIT_LOG_SIZE;
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogHead, &next_head);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogTotal, &(total + 1));
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -527,7 +648,10 @@ impl RiskRegistryContract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::Address as _, Bytes, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger, LedgerInfo},
+        Bytes, Env,
+    };
 
     /// Returns (env, admin, invoice_nft, staking_token, client)
     fn setup() -> (Env, Address, Address, Address, RiskRegistryContractClient<'static>) {
@@ -1115,19 +1239,23 @@ mod tests {
         assert_eq!(client.get_sme_profile(&sme).unwrap().risk_score, 0);
     }
 
-    // ── set_debtor_score update (overwrite) ───────────────────────────────────
+    // ── set_debtor_score update (overwrite after cooldown) ───────────────────
 
     #[test]
     fn test_set_debtor_score_update_existing() {
-        // set_debtor_score is idempotent / overwrites — calling it twice for the
-        // same hash with a different score must persist the latest value.
-        let (env, admin, _, client) = setup();
+        // set_debtor_score overwrites the score — calling it a second time after the
+        // cooldown elapses must persist the latest value.
+        let (env, admin, _, _, client) = setup();
         let verifier = Address::generate(&env);
         let debtor_hash = Bytes::from_slice(&env, &[0xAAu8; 32]);
-        client.add_verifier(&admin, &verifier).unwrap();
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
         client.set_debtor_score(&verifier, &debtor_hash, &30u32).unwrap();
         assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 30);
-        // Overwrite with a new score.
+        // Advance past the cooldown before the second update.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL,
+            ..env.ledger().get()
+        });
         client.set_debtor_score(&verifier, &debtor_hash, &75u32).unwrap();
         assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 75);
     }
@@ -1190,5 +1318,78 @@ mod tests {
         let contract_id = env.register_contract(None, RiskRegistryContract);
         let client = RiskRegistryContractClient::new(&env, &contract_id);
         assert!(client.try_get_admin().is_err());
+    }
+
+    // ── set_debtor_score cooldown ─────────────────────────────────────────────
+
+    #[test]
+    fn test_set_debtor_score_first_call_always_succeeds() {
+        // There is no prior timestamp, so the first update is always allowed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xBBu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &40u32)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_blocks_immediate_second_update() {
+        // A second update before MIN_SCORE_UPDATE_INTERVAL seconds have passed
+        // must be rejected with ScoreUpdateCooldownNotElapsed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xCCu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        client.set_debtor_score(&verifier, &debtor_hash, &40u32).unwrap();
+        // Advance time by one second less than the cooldown — still blocked.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL - 1,
+            ..env.ledger().get()
+        });
+        let err = client
+            .try_set_debtor_score(&verifier, &debtor_hash, &60u32)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::ScoreUpdateCooldownNotElapsed);
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_allows_update_at_exact_boundary() {
+        // At exactly timestamp == last_update + MIN_SCORE_UPDATE_INTERVAL the
+        // condition `current < next_allowed` is false, so the call must succeed.
+        let (env, admin, _, _, client) = setup();
+        let verifier = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xDDu8; 32]);
+        client.add_verifier(&admin, &verifier, &1_000_000i128).unwrap();
+        // First update at t=0.
+        client.set_debtor_score(&verifier, &debtor_hash, &40u32).unwrap();
+        // Advance to exactly the boundary.
+        env.ledger().set(LedgerInfo {
+            timestamp: MIN_SCORE_UPDATE_INTERVAL,
+            ..env.ledger().get()
+        });
+        assert!(client
+            .try_set_debtor_score(&verifier, &debtor_hash, &55u32)
+            .is_ok());
+        assert_eq!(client.get_debtor_score(&debtor_hash).unwrap(), 55);
+    }
+
+    #[test]
+    fn test_set_debtor_score_cooldown_is_per_verifier() {
+        // Different verifiers operate independent cooldowns for the same debtor_hash.
+        let (env, admin, _, _, client) = setup();
+        let verifier_a = Address::generate(&env);
+        let verifier_b = Address::generate(&env);
+        let debtor_hash = Bytes::from_slice(&env, &[0xEEu8; 32]);
+        client.add_verifier(&admin, &verifier_a, &1_000_000i128).unwrap();
+        client.add_verifier(&admin, &verifier_b, &1_000_000i128).unwrap();
+        // verifier_a sets the score; its cooldown now ticks.
+        client.set_debtor_score(&verifier_a, &debtor_hash, &40u32).unwrap();
+        // verifier_b has never updated this debtor → no cooldown → must succeed.
+        assert!(client
+            .try_set_debtor_score(&verifier_b, &debtor_hash, &55u32)
+            .is_ok());
     }
 }

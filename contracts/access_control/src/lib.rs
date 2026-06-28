@@ -1,10 +1,11 @@
 #![no_std]
 
 use kora_shared::{
+    audit::{AdminActionType, AdminAuditEntry, AuditSource, MAX_AUDIT_LOG_SIZE},
     errors::KoraError,
     events,
     reentrancy::ReentrancyGuard,
-    types::{MultisigConfig, ParameterKey, ParameterProposal},
+    types::{AdminAction, MultisigConfig, ParameterKey, ParameterProposal, Proposal},
     validation::UPGRADE_TIMELOCK_DELAY,
 };
 use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec};
@@ -31,12 +32,23 @@ pub enum DataKey {
     UpgradeProposal,
     /// Multisig configuration (threshold + signer set).
     MultisigConfig,
+    /// Monotonic counter for the next multisig proposal id.
+    NextProposalId,
+    /// A pending multisig action proposal, keyed by proposal id.
+    Proposal(u64),
     /// A pending protocol-parameter governance proposal, keyed by id.
     ParameterProposal(u64),
     /// Monotonic counter for the next parameter-proposal id.
     NextParamProposalId,
     /// The current governed value of a protocol parameter.
     Parameter(ParameterKey),
+    // ── Audit log ─────────────────────────────────────────────────────────────
+    /// Next write position in the audit ring buffer (0..MAX_AUDIT_LOG_SIZE).
+    AuditLogHead,
+    /// Total admin actions ever recorded (monotonic; not capped at ring size).
+    AuditLogTotal,
+    /// An audit log entry at ring-buffer position `n`.
+    AuditEntry(u64),
 }
 
 const PROPOSAL_TTL_LEDGERS: u64 = 120_960; // ~7 days at ~5s/ledger
@@ -66,7 +78,8 @@ impl AccessControlContract {
             return Err(KoraError::AlreadyInitialized);
         }
         kora_shared::validation::require_not_self(&env, &admin)?;
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage().instance().set(&DataKey::Paused, &false);
         env.storage()
             .persistent()
@@ -92,6 +105,7 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &true);
         events::protocol_paused(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::Pause);
         Ok(())
     }
 
@@ -110,6 +124,7 @@ impl AccessControlContract {
         let _guard = ReentrancyGuard::new(&env)?;
         env.storage().instance().set(&DataKey::Paused, &false);
         events::protocol_unpaused(&env, &admin);
+        Self::append_audit_entry(&env, &admin, AdminActionType::Unpause);
         Ok(())
     }
 
@@ -143,6 +158,7 @@ impl AccessControlContract {
             .set(&DataKey::Role(target.clone()), &role);
         Self::bump_persistent(&env, &DataKey::Role(target.clone()));
         events::role_granted(&env, &admin, &target);
+        Self::append_audit_entry(&env, &admin, AdminActionType::GrantRole);
         Ok(())
     }
 
@@ -169,6 +185,7 @@ impl AccessControlContract {
             .persistent()
             .remove(&DataKey::Role(target.clone()));
         events::role_revoked(&env, &admin, &target);
+        Self::append_audit_entry(&env, &admin, AdminActionType::RevokeRole);
         Ok(())
     }
 
@@ -190,15 +207,8 @@ impl AccessControlContract {
             return Err(KoraError::InvalidAddress);
         }
         kora_shared::validation::require_not_self(&env, &new_admin)?;
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Role(current_admin), &Role::None);
-        // Guard: new_admin must not already hold a role (Operator/Verifier)
-        // to prevent silent role overwrite.
+
+        // Guard: new_admin must not already hold a non-Admin role to prevent silent overwrite.
         let existing = env
             .storage()
             .persistent()
@@ -207,7 +217,9 @@ impl AccessControlContract {
         if existing != Role::None && existing != Role::Admin {
             return Err(KoraError::Unauthorized);
         }
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
+
+        env.storage().persistent().set(&DataKey::Admin, &new_admin);
+        Self::bump_persistent(&env, &DataKey::Admin);
         env.storage()
             .persistent()
             .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
@@ -217,6 +229,7 @@ impl AccessControlContract {
             .persistent()
             .remove(&DataKey::Role(current_admin.clone()));
         events::admin_transferred(&env, &current_admin, &new_admin);
+        Self::append_audit_entry(&env, &current_admin, AdminActionType::TransferAdmin);
         Ok(())
     }
 
@@ -251,6 +264,7 @@ impl AccessControlContract {
         }
 
         events::multisig_configured(&env, threshold, signer_count);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ConfigureMultisig);
         Ok(())
     }
 
@@ -392,7 +406,8 @@ impl AccessControlContract {
                 events::role_revoked(&env, &executor, &target);
             }
             AdminAction::TransferAdmin(new_admin) => {
-                env.storage().instance().set(&DataKey::Admin, &new_admin);
+                env.storage().persistent().set(&DataKey::Admin, &new_admin);
+                Self::bump_persistent(&env, &DataKey::Admin);
                 env.storage()
                     .persistent()
                     .set(&DataKey::Role(new_admin.clone()), &Role::Admin);
@@ -402,6 +417,7 @@ impl AccessControlContract {
         }
 
         events::action_executed(&env, proposal_id, &executor);
+        Self::append_audit_entry(&env, &executor, AdminActionType::MultisigExecuteAction);
         Ok(())
     }
 
@@ -468,6 +484,7 @@ impl AccessControlContract {
         );
 
         events::action_proposed(&env, proposal_id, &proposer);
+        Self::append_audit_entry(&env, &proposer, AdminActionType::ProposeParameter);
         Ok(proposal_id)
     }
 
@@ -549,6 +566,7 @@ impl AccessControlContract {
         Self::bump_persistent(&env, &DataKey::Parameter(proposal.key.clone()));
 
         events::action_executed(&env, proposal_id, &caller);
+        Self::append_audit_entry(&env, &caller, AdminActionType::ExecuteParameter);
         Ok(())
     }
 
@@ -618,6 +636,7 @@ impl AccessControlContract {
             &(new_wasm_hash.clone(), env.ledger().timestamp()),
         );
         events::upgrade_proposed(&env, &admin, &new_wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ProposeUpgrade);
         Ok(())
     }
 
@@ -634,11 +653,91 @@ impl AccessControlContract {
         }
         env.storage().instance().remove(&DataKey::UpgradeProposal);
         events::upgrade_executed(&env, &admin, &wasm_hash);
+        Self::append_audit_entry(&env, &admin, AdminActionType::ExecuteUpgrade);
         env.deployer().update_current_contract_wasm(wasm_hash);
         Ok(())
     }
 
+    // ── Audit Log ─────────────────────────────────────────────────────────────
+
+    /// Return a page of audit log entries, newest first.
+    /// `page` is 0-indexed; `page_size` is clamped to 1–50.
+    pub fn get_audit_log(env: Env, page: u32, page_size: u32) -> Vec<AdminAuditEntry> {
+        let page_size = (page_size.max(1).min(50)) as u64;
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+        let stored = total.min(MAX_AUDIT_LOG_SIZE);
+
+        let skip = (page as u64).saturating_mul(page_size);
+        let mut results = Vec::new(&env);
+
+        let mut i: u64 = 0;
+        while i < page_size {
+            let offset = skip + i;
+            if offset >= stored {
+                break;
+            }
+            // Walk backwards from the most recently written slot.
+            let pos = (head + MAX_AUDIT_LOG_SIZE - 1 - offset) % MAX_AUDIT_LOG_SIZE;
+            if let Some(entry) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, AdminAuditEntry>(&DataKey::AuditEntry(pos))
+            {
+                results.push_back(entry);
+            }
+            i += 1;
+        }
+
+        results
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Append one entry to the ring-buffer audit log and emit the canonical event.
+    fn append_audit_entry(env: &Env, actor: &Address, action: AdminActionType) {
+        let total: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogTotal)
+            .unwrap_or(0);
+        let head: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AuditLogHead)
+            .unwrap_or(0);
+
+        let entry = AdminAuditEntry {
+            sequence: total,
+            timestamp: env.ledger().timestamp(),
+            actor: actor.clone(),
+            action,
+            source: AuditSource::AccessControl,
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::AuditEntry(head), &entry);
+        Self::bump_persistent(env, &DataKey::AuditEntry(head));
+
+        events::admin_action_audited(env, &entry);
+
+        let next_head = (head + 1) % MAX_AUDIT_LOG_SIZE;
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogHead, &next_head);
+        env.storage()
+            .instance()
+            .set(&DataKey::AuditLogTotal, &(total + 1));
+    }
 
     /// Read the paused flag from persistent storage.
     fn read_paused(env: &Env) -> bool {
