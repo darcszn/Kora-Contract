@@ -20,6 +20,7 @@
 //! - Input validation is centralized and consistent across all contracts
 //! - Storage keys use `#[contracttype]` enums for type safety
 
+pub mod audit;
 pub mod errors;
 pub mod events;
 pub mod reentrancy;

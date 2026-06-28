@@ -1,3 +1,4 @@
+use crate::audit::AdminAuditEntry;
 use soroban_sdk::{symbol_short, Address, Bytes, Env, Symbol};
 
 // ── Canonical Event Schema ────────────────────────────────────────────────────
@@ -476,5 +477,87 @@ pub fn position_sold(env: &Env, invoice_id: u64, seller: &Address, buyer: &Addre
         env,
         symbol_short!("POS_SOLD"),
         (invoice_id, seller.clone(), buyer.clone(), price, env.ledger().timestamp()),
+    );
+}
+
+// ── Treasury Cap Events ───────────────────────────────────────────────────────
+
+/// Schema: (actor=admin, new_cap, timestamp)
+pub fn withdrawal_cap_proposed(env: &Env, admin: &Address, new_cap: i128) {
+    emit(
+        env,
+        symbol_short!("WTH_CAP_P"),
+        (admin.clone(), new_cap, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, old_cap, new_cap, timestamp)
+pub fn withdrawal_cap_updated(env: &Env, admin: &Address, old_cap: i128, new_cap: i128) {
+    emit(
+        env,
+        symbol_short!("WTH_CAP_U"),
+        (admin.clone(), old_cap, new_cap, env.ledger().timestamp()),
+    );
+}
+
+// ── Risk Registry — Credit Limit ─────────────────────────────────────────────
+
+/// Schema: (actor=verifier, sme, credit_limit, timestamp)
+pub fn sme_credit_limit_set(env: &Env, verifier: &Address, sme: &Address, credit_limit: i128) {
+    emit(
+        env,
+        symbol_short!("SME_CL_SET"),
+        (verifier.clone(), sme.clone(), credit_limit, env.ledger().timestamp()),
+    );
+}
+
+// ── Invoice Freeze Events ─────────────────────────────────────────────────────
+
+/// Schema: (actor=admin, invoice_id, timestamp)
+pub fn invoice_frozen(env: &Env, invoice_id: u64, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_FRZ"),
+        (admin.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+/// Schema: (actor=admin, invoice_id, timestamp)
+pub fn invoice_unfrozen(env: &Env, invoice_id: u64, admin: &Address) {
+    emit(
+        env,
+        symbol_short!("INV_UFRZ"),
+        (admin.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+// ── Marketplace Cancellation Events ──────────────────────────────────────────
+
+/// Schema: (actor=caller, invoice_id, timestamp)
+pub fn cancellation_requested(env: &Env, invoice_id: u64, caller: &Address) {
+    emit(
+        env,
+        symbol_short!("CXL_REQ"),
+        (caller.clone(), invoice_id, env.ledger().timestamp()),
+    );
+}
+
+// ── Admin Audit Trail ─────────────────────────────────────────────────────────
+
+/// Canonical admin-action audit event emitted alongside every admin-gated call.
+/// Subscribe to `ADM_AUDIT` across all protocol contracts to build a consolidated
+/// off-chain compliance report via Horizon, Mercury, or a custom indexer.
+/// Schema: (sequence, actor, action, source, timestamp)
+pub fn admin_action_audited(env: &Env, entry: &AdminAuditEntry) {
+    emit(
+        env,
+        symbol_short!("ADM_AUDIT"),
+        (
+            entry.sequence,
+            entry.actor.clone(),
+            entry.action.clone(),
+            entry.source.clone(),
+            entry.timestamp,
+        ),
     );
 }

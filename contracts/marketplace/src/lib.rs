@@ -168,11 +168,6 @@ impl MarketplaceContract {
         Ok(Self::load_config(&env)?.admin)
     }
 
-    /// Update the marketplace fee. Admin only. Alias for set_fee_bps used by tests.
-    pub fn update_fee_bps(env: Env, admin: Address, fee_bps: u32) -> Result<(), KoraError> {
-        Self::set_fee_bps(env, admin, fee_bps)
-    }
-
     /// Whitelist a stablecoin token. Admin only.
     pub fn whitelist_token(env: Env, admin: Address, token: Address) -> Result<(), KoraError> {
         admin.require_auth();
@@ -335,12 +330,19 @@ impl MarketplaceContract {
 
         let config = Self::load_config(&env)?;
 
+        // Check per-invoice freeze before any token operations.
+        // Enforced in addition to the protocol-wide pause so a single disputed
+        // invoice can be frozen without halting all protocol activity.
+        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
+        if nft_client.is_invoice_frozen(&invoice_id) {
+            return Err(KoraError::InvoiceFrozen);
+        }
+
         let token_client = token::Client::new(&env, &listing.token);
         let token_decimals = token_client.decimals();
 
         // Fetch the invoice's risk tier and apply tier-specific fee (#210)
-        let nft_client = kora_invoice_nft::InvoiceNftContractClient::new(&env, &config.invoice_nft);
-        let invoice = nft_client.get_invoice(&invoice_id)?;
+        let invoice = nft_client.get_invoice(&invoice_id);
         let effective_fee_bps: u32 = env.storage().instance()
             .get(&DataKey::TierFeeBps(Self::tier_ordinal(&invoice.risk_tier)))
             .unwrap_or(config.fee_bps);
@@ -637,6 +639,15 @@ impl MarketplaceContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    fn require_compliance_attested(env: &Env, sme: &Address) -> Result<(), KoraError> {
+        let config = Self::load_config(env)?;
+        let rr = kora_risk_registry::RiskRegistryContractClient::new(env, &config.risk_registry);
+        if !rr.is_compliance_attested(sme) {
+            return Err(KoraError::ComplianceNotAttested);
+        }
+        Ok(())
+    }
+
     fn require_whitelisted_token(env: &Env, token: &Address) -> Result<(), KoraError> {
         let ok: bool = env
             .storage()
@@ -646,13 +657,7 @@ impl MarketplaceContract {
         if !ok {
             return Err(KoraError::TokenNotWhitelisted);
         }
-    }
-
-    pub fn is_token_whitelisted(env: Env, token: Address) -> bool {
-        env.storage()
-            .persistent()
-            .get(&DataKey::WhitelistedToken(token))
-            .unwrap_or(false)
+        Ok(())
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -782,10 +787,6 @@ impl MarketplaceContract {
             PERSISTENT_TTL_THRESHOLD,
             PERSISTENT_TTL_BUMP,
         );
-    }
-
-    fn bump_persistent(env: &Env, key: &DataKey) {
-        env.storage().persistent().extend_ttl(key, PERSISTENT_TTL_THRESHOLD, PERSISTENT_TTL_BUMP);
     }
 
     /// Map RiskTier to a stable u32 ordinal for storage keying. (#210)

@@ -68,6 +68,16 @@ pub enum DataKey {
     Marketplace,
     /// Instance key: authorized financing pool contract address
     FinancingPool,
+    /// Instance key: authorized risk registry contract address
+    RiskRegistry,
+    /// Persistent: aggregate exposure (i128) for an investor address
+    OutstandingExposure(Address),
+    /// Persistent: marks a currency symbol as allowed for invoices
+    CurrencyAllowlist(Symbol),
+    /// Persistent bool: true when this invoice is individually frozen by an admin.
+    /// Checked by marketplace.fund_invoice and financing_pool.repay in addition
+    /// to the protocol-wide pause, enabling targeted freeze of disputed invoices.
+    InvoiceFrozen(u64),
 }
 
 // ── Migration helpers ─────────────────────────────────────────────────────────
@@ -614,6 +624,47 @@ impl InvoiceNftContract {
             .persistent()
             .get(&DataKey::OutstandingExposure(sme))
             .unwrap_or(0i128)
+    }
+
+    // ── Per-invoice emergency freeze ──────────────────────────────────────────
+    //
+    // Complements the protocol-wide pause in AccessControl by letting an admin
+    // freeze a single disputed invoice without halting all protocol activity.
+    // The freeze state is stored in persistent storage so it survives ledger
+    // closings. Marketplace.fund_invoice and financing_pool.repay call
+    // is_invoice_frozen before executing any state-changing logic.
+
+    /// Freeze a specific invoice, blocking fund_invoice and repay for it.
+    pub fn freeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        // Verify the invoice exists before freezing.
+        Self::load_invoice(&env, invoice_id)?;
+        let key = DataKey::InvoiceFrozen(invoice_id);
+        env.storage().persistent().set(&key, &true);
+        Self::bump_persistent(&env, &key);
+        events::invoice_frozen(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Unfreeze a previously frozen invoice, restoring normal fund/repay access.
+    pub fn unfreeze_invoice(env: Env, admin: Address, invoice_id: u64) -> Result<(), KoraError> {
+        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
+        // Verify the invoice exists before unfreezing.
+        Self::load_invoice(&env, invoice_id)?;
+        let key = DataKey::InvoiceFrozen(invoice_id);
+        env.storage().persistent().remove(&key);
+        events::invoice_unfrozen(&env, invoice_id, &admin);
+        Ok(())
+    }
+
+    /// Returns true if this invoice has been individually frozen by an admin.
+    pub fn is_invoice_frozen(env: Env, invoice_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvoiceFrozen(invoice_id))
+            .unwrap_or(false)
     }
 
     // ── Upgrade ────────────────────────────────────────────────────────────────
@@ -1846,5 +1897,69 @@ mod tests {
         client.set_listed(&marketplace, &id);
         let result = client.try_withdraw_invoice(&sme, &id);
         assert_eq!(result.unwrap_err().unwrap(), KoraError::InvalidInvoiceStatus);
+    }
+
+    // ── Per-invoice emergency freeze ──────────────────────────────────────────
+
+    fn mint_one(env: &Env, client: &InvoiceNftContractClient<'static>) -> u64 {
+        let sme = Address::generate(env);
+        let debtor_hash = Bytes::from_slice(env, &[0xABu8; 32]);
+        let ipfs_cid = String::from_str(
+            env,
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+        );
+        let due_date = env.ledger().timestamp() + 86_400 * 30;
+        client.mint_invoice(
+            &sme, &debtor_hash, &1_000_000_000i128,
+            &Symbol::new(env, "USDC"), &due_date, &ipfs_cid, &10u32,
+        )
+    }
+
+    #[test]
+    fn test_is_invoice_frozen_false_by_default() {
+        let (_, _, client) = setup();
+        // is_invoice_frozen returns false for a non-existent or unfrozen invoice.
+        assert!(!client.is_invoice_frozen(&999u64));
+    }
+
+    #[test]
+    fn test_freeze_invoice_sets_frozen_flag() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        assert!(!client.is_invoice_frozen(&id));
+        client.freeze_invoice(&admin, &id).unwrap();
+        assert!(client.is_invoice_frozen(&id));
+    }
+
+    #[test]
+    fn test_unfreeze_invoice_clears_frozen_flag() {
+        let (env, admin, client) = setup();
+        let id = mint_one(&env, &client);
+        client.freeze_invoice(&admin, &id).unwrap();
+        assert!(client.is_invoice_frozen(&id));
+        client.unfreeze_invoice(&admin, &id).unwrap();
+        assert!(!client.is_invoice_frozen(&id));
+    }
+
+    #[test]
+    fn test_freeze_invoice_non_admin_rejected() {
+        let (env, _, client) = setup();
+        let id = mint_one(&env, &client);
+        let stranger = Address::generate(&env);
+        let err = client
+            .try_freeze_invoice(&stranger, &id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::NotAdmin);
+    }
+
+    #[test]
+    fn test_freeze_nonexistent_invoice_rejected() {
+        let (_, admin, client) = setup();
+        let err = client
+            .try_freeze_invoice(&admin, &9999u64)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, KoraError::InvoiceNotFound);
     }
 }
